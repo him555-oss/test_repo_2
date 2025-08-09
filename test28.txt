@@ -1,0 +1,130 @@
+name: Mirror to Bitbucket (--mirror, destructive + include private)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    env:
+      GH_OWNER: him555-oss        # ชื่อบัญชี GitHub
+      GH_IS_USER: "true"          # "true" = user, "false" = org
+      BB_WORKSPACE: santichaina   # Workspace ID (ตัวพิมพ์เล็ก)
+
+    steps:
+      - name: Install jq
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+
+      - name: Setup SSH for Bitbucket
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "${{ secrets.SSH_PRIVATE_KEY }}" > "$HOME/.ssh/id_rsa"
+          chmod 600 "$HOME/.ssh/id_rsa"
+          ssh-keyscan bitbucket.org >> "$HOME/.ssh/known_hosts"
+
+      - name: Who am I on Bitbucket SSH
+        shell: bash
+        run: ssh -T git@bitbucket.org || true
+
+      # ===== Build repos.txt: รวม private ด้วย =====
+      - name: Build repos.txt (include private)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          GH_PAT="$(printf '%s' "${GH_TOKEN:-}" | tr -d '\r\n')"
+          [ -n "$GH_PAT" ] || { echo "ERROR: GH_TOKEN missing"; exit 1; }
+
+          # ตรวจ user ของ token (กันสลับคน)
+          AUTH_LOGIN="$(curl -sS -H "Authorization: Bearer ${GH_PAT}" https://api.github.com/user | jq -r .login)"
+          echo "Token user: ${AUTH_LOGIN}"
+
+          : > repos.txt
+          page=1
+          while :; do
+            if [ "${GH_IS_USER}" = "true" ]; then
+              # ใช้ /user/repos เพื่อให้เห็น private; affiliation=owner เพื่อเอาเฉพาะที่ user นี้เป็นเจ้าของ
+              url="https://api.github.com/user/repos?per_page=100&page=${page}&visibility=all&affiliation=owner"
+            else
+              # กรณี organization: ต้องมี read:org และ (ถ้า org ใช้ SSO) ต้อง Authorize SSO ให้ token
+              url="https://api.github.com/orgs/${GH_OWNER}/repos?per_page=100&page=${page}&type=all"
+            fi
+
+            resp="$(curl -sS -H "Authorization: Bearer ${GH_PAT}" -H "Accept: application/vnd.github+json" "$url")"
+            echo "$resp" | jq -e 'type=="array"' >/dev/null \
+              || { echo "GitHub API error:"; echo "$resp" | jq . || echo "$resp"; exit 1; }
+
+            count="$(echo "$resp" | jq 'length')"
+            [ "$count" -eq 0 ] && break
+
+            if [ "${GH_IS_USER}" = "true" ]; then
+              # กรองให้แน่ใจว่า owner.login ตรงกับ GH_OWNER (กันเผลอหยิบรีโปของ org อื่นที่ token เห็น)
+              echo "$resp" | jq -r --arg owner "$GH_OWNER" 'map(select(.owner.login==$owner)) | .[].name' >> repos.txt
+            else
+              # org: เอาชื่อทั้งหมด (type=all ครอบ public+private)
+              echo "$resp" | jq -r '.[].name' >> repos.txt
+            fi
+
+            [ "$count" -lt 100 ] && break
+            page=$((page+1))
+          done
+
+          sort -u -o repos.txt repos.txt
+          [ -s repos.txt ] || { echo "ERROR: repos.txt empty"; exit 1; }
+          echo "repos.txt (first 100):"
+          nl -ba repos.txt | sed -n '1,100p'
+
+      - name: Upload repos.txt (artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: repos.txt
+          path: repos.txt
+
+      # ===== Push แบบทำลาย (--mirror): ระวัง! จะลบ refs ที่ไม่มีใน GitHub ณ ตอนรัน =====
+      - name: Mirror with DELETION (--mirror)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          GH_PAT="$(printf '%s' "${GH_TOKEN:-}" | tr -d '\r\n')"
+
+          while IFS= read -r REPO || [ -n "$REPO" ]; do
+            [ -n "$REPO" ] || continue
+            SLUG="$(echo "$REPO" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g')"
+            BB_URL="git@bitbucket.org:${BB_WORKSPACE}/${SLUG}.git"
+            echo ">>> $REPO -> $BB_URL"
+
+            if ! git ls-remote "$BB_URL" >/dev/null 2>&1; then
+              echo "Skip: $BB_URL not accessible"; continue
+            fi
+
+            SRC="https://x-access-token:${GH_PAT}@github.com/${GH_OWNER}/${REPO}.git"
+            rm -rf "${REPO}.git"
+            if ! git clone --mirror "$SRC" "${REPO}.git"; then
+              echo "Clone failed: $REPO"; continue
+            fi
+
+            (
+              cd "${REPO}.git"
+              git remote add bitbucket "$BB_URL" 2>/dev/null || git remote set-url bitbucket "$BB_URL"
+
+              # พรีวิวสิ่งที่จะโดนลบ (refs ที่มีใน target แต่ไม่มีใน source ตอนนี้)
+              {
+                echo "--- Preview deletions (branches) ---"
+                LCL_HEADS="$(git for-each-ref --format='%(refname:short)' refs/heads | sort || true)"
+                TGT_HEADS="$(git ls-remote --heads "$BB_URL" | sed 's@.*refs/heads/@@' | sort || true)"
+                printf "%s\n" "$LCL_HEADS" > /tmp/src_heads.txt
+                printf "%s\n" "$TGT_HEADS" > /tmp/tgt_heads.txt
+                comm -13 /tmp/src_heads.txt /tmp/tgt_heads.txt || true
+
+                echo "--- Preview deletions (tags) ---"
+                LCL_TAGS="$(git for-each-ref --format='%(refname:short)' refs/tags | sort || true)"
+                TGT_TAGS="$(git ls-remote --tags "$BB_URL" | sed 's@.*refs/tags/@@' | sed 's/\^{}$//' | so*
